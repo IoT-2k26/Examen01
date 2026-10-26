@@ -1,8 +1,8 @@
 
 # ==========================================================
 # PROYECTO: MONITOREO DE UN INVERNADERO
-# Raspberry Pi 5 + Python + MongoDB
-# Sin convertidor MCP3008
+# Raspberry Pi 5 + Python + MongoDB en Docker Desktop
+# Administracion remota mediante RealVNC Viewer
 # ==========================================================
 
 from gpiozero import DigitalInputDevice, LED, OutputDevice
@@ -20,11 +20,11 @@ from pymongo.errors import PyMongoError
 # ==========================================================
 
 # Sensores
-PIN_DHT = 4                 # DHT22: humedad y temperatura ambiente
-PIN_SUELO = 6               # Sensor digital de suelo
-PIN_AGUA = 5                # Sensor digital de nivel de agua
-PIN_TEMPERATURA = 24        # Alarma digital de temperatura
-PIN_LUZ = 25                # Sensor digital de luz
+PIN_DHT = 4
+PIN_SUELO = 6
+PIN_AGUA = 5
+PIN_TEMPERATURA = 24
+PIN_LUZ = 25
 
 # LED RGB
 PIN_ROJO = 17
@@ -39,39 +39,38 @@ INTERVALO = 5
 
 
 # ==========================================================
-# 2. PARAMETROS DEL INVERNADERO
+# 2. PARAMETROS DEL SISTEMA
 # ==========================================================
 
-TEMP_MIN = 15
-TEMP_MAX = 30
+TEMP_MIN = 15.0
+TEMP_MAX = 30.0
 
-HUMEDAD_AIRE_MIN = 50
-HUMEDAD_AIRE_MAX = 85
+HUMEDAD_AIRE_MIN = 50.0
+HUMEDAD_AIRE_MAX = 85.0
 
-# Umbral del modulo digital de temperatura:
-# Ajustarlo fisicamente en el modulo, si dispone de ajuste.
-# GPIO24 solo informa si se activo la alarma digital.
-
-# Cambiar a False si el modulo activa su salida con nivel bajo.
+# Configuracion de polaridad de las entradas.
+# True: el estado activo corresponde a nivel alto.
+# False: el estado activo corresponde a nivel bajo.
 SUELO_SECO_ACTIVO_EN_ALTO = True
 AGUA_BAJA_ACTIVA_EN_ALTO = True
 POCA_LUZ_ACTIVA_EN_ALTO = True
 ALARMA_TEMP_ACTIVA_EN_ALTO = True
 
-# Reles habitualmente disponibles en modulos activos en bajo.
-# Cambiar a True si tu rele se activa con nivel alto.
+# Muchos modulos de rele son activos en nivel bajo.
+# Verificar la polaridad del modulo antes de conectar la bomba.
 RELE_ACTIVO_EN_ALTO = False
 
-# Seguridad: la bomba se activa unicamente cuando el suelo
-# esta seco y hay agua suficiente.
-# El control de riego es automatico.
+# Para un LED RGB de catodo comun, LED.on() activa el canal.
+# Si el RGB es de anodo comun, se debe adaptar su control.
 
 
 # ==========================================================
 # 3. CONFIGURACION DE MONGODB
 # ==========================================================
 
-MONGO_URI = "mongodb://localhost:27017/"
+# MongoDB corre en Docker Desktop en Windows.
+MONGO_URI = "mongodb://10.90.30.79:27017/"
+
 BASE_DATOS = "invernadero"
 COLECCION = "mediciones"
 
@@ -81,16 +80,11 @@ COLECCION = "mediciones"
 # ==========================================================
 
 def crear_entrada(pin, activo_en_alto):
-    """Crea una entrada digital con la polaridad configurada."""
     return DigitalInputDevice(
         pin,
         pull_up=False,
         active_state=activo_en_alto
     )
-
-
-def limitar(valor, minimo, maximo):
-    return max(minimo, min(valor, maximo))
 
 
 def apagar_rgb():
@@ -120,12 +114,7 @@ def mostrar_color(color):
 # 5. LECTURA DE SENSORES
 # ==========================================================
 
-def leer_sensores():
-    """
-    Las entradas digitales no proporcionan porcentajes
-    analogicos. Cada modulo indica un estado o umbral.
-    """
-
+def leer_sensores_digitales():
     return {
         "suelo_seco": suelo_sensor.is_active,
         "agua_baja": agua_sensor.is_active,
@@ -135,7 +124,6 @@ def leer_sensores():
 
 
 def leer_dht():
-    """Lee temperatura y humedad del DHT22."""
     try:
         temperatura = dht.temperature
         humedad = dht.humidity
@@ -190,12 +178,12 @@ def evaluar_riego(suelo_seco, agua_baja):
     return "Riego apagado: suelo no indica sequedad"
 
 
-def controlar_riego(suelo_seco, agua_baja):
-    """
-    Enciende la bomba si el sensor indica suelo seco
-    y el sensor de agua NO indica nivel bajo.
-    """
+# ==========================================================
+# 7. CONTROL DEL RELE
+# ==========================================================
 
+def controlar_riego(suelo_seco, agua_baja):
+    # Seguridad basica: nunca solicitar riego con agua baja.
     activar = suelo_seco and not agua_baja
 
     if activar:
@@ -206,24 +194,32 @@ def controlar_riego(suelo_seco, agua_baja):
     return activar
 
 
-def controlar_indicador(poca_luz, agua_baja, suelo_seco,
-                        alarma_temperatura):
+# ==========================================================
+# 8. CONTROL DEL LED RGB
+# ==========================================================
+
+def controlar_indicador(
+    poca_luz,
+    agua_baja,
+    suelo_seco,
+    alarma_temperatura
+):
     # Prioridad 1: poca luz
     if poca_luz:
         mostrar_color("violeta")
-        return "Violeta: poca luz"
+        return "Violeta: poca luz ambiental"
 
     # Prioridad 2: nivel de agua bajo
     if agua_baja:
         mostrar_color("rojo")
         return "Rojo: nivel de agua bajo"
 
-    # Prioridad 3: alarma digital de temperatura
+    # Prioridad 3: alarma de temperatura
     if alarma_temperatura:
         mostrar_color("rojo")
         return "Rojo: alarma de temperatura"
 
-    # Prioridad 4: suelo seco y riego solicitado
+    # Prioridad 4: solicitud de riego
     if suelo_seco:
         mostrar_color("azul")
         return "Azul: riego solicitado"
@@ -233,90 +229,116 @@ def controlar_indicador(poca_luz, agua_baja, suelo_seco,
 
 
 # ==========================================================
-# 7. INICIALIZACION DE HARDWARE
-# ==========================================================
-
-# Entradas digitales
-suelo_sensor = crear_entrada(
-    PIN_SUELO, SUELO_SECO_ACTIVO_EN_ALTO
-)
-
-agua_sensor = crear_entrada(
-    PIN_AGUA, AGUA_BAJA_ACTIVA_EN_ALTO
-)
-
-luz_sensor = crear_entrada(
-    PIN_LUZ, POCA_LUZ_ACTIVA_EN_ALTO
-)
-
-temperatura_sensor = crear_entrada(
-    PIN_TEMPERATURA, ALARMA_TEMP_ACTIVA_EN_ALTO
-)
-
-# DHT22
-dht = adafruit_dht.DHT22(
-    board.D4,
-    use_pulseio=False
-)
-
-# LED RGB: se supone catodo comun
-led_rojo = LED(PIN_ROJO)
-led_verde = LED(PIN_VERDE)
-led_azul = LED(PIN_AZUL)
-
-# Rele: inicialmente apagado
-rele = OutputDevice(
-    PIN_RELE,
-    active_high=RELE_ACTIVO_EN_ALTO,
-    initial_value=False
-)
-
-
-# ==========================================================
-# 8. CONEXION A MONGODB
+# 9. INICIALIZACION DEL HARDWARE
 # ==========================================================
 
 cliente = None
 coleccion = None
 
+# Declarar recursos antes del try para permitir limpieza segura.
+suelo_sensor = None
+agua_sensor = None
+luz_sensor = None
+temperatura_sensor = None
+dht = None
+
+led_rojo = None
+led_verde = None
+led_azul = None
+rele = None
+
 try:
-    cliente = MongoClient(
-        MONGO_URI,
-        serverSelectionTimeoutMS=3000
+    # Entradas digitales
+    suelo_sensor = crear_entrada(
+        PIN_SUELO,
+        SUELO_SECO_ACTIVO_EN_ALTO
     )
 
-    cliente.admin.command("ping")
+    agua_sensor = crear_entrada(
+        PIN_AGUA,
+        AGUA_BAJA_ACTIVA_EN_ALTO
+    )
 
-    base_datos = cliente[BASE_DATOS]
-    coleccion = base_datos[COLECCION]
+    luz_sensor = crear_entrada(
+        PIN_LUZ,
+        POCA_LUZ_ACTIVA_EN_ALTO
+    )
 
-    print("Conexion con MongoDB correcta.")
+    temperatura_sensor = crear_entrada(
+        PIN_TEMPERATURA,
+        ALARMA_TEMP_ACTIVA_EN_ALTO
+    )
 
-except PyMongoError as error:
-    print("No se pudo conectar con MongoDB:", error)
-    print("El monitoreo continuara sin guardar registros.")
+    # DHT22 en GPIO4
+    dht = adafruit_dht.DHT22(
+        board.D4,
+        use_pulseio=False
+    )
 
+    # LED RGB de catodo comun
+    led_rojo = LED(PIN_ROJO)
+    led_verde = LED(PIN_VERDE)
+    led_azul = LED(PIN_AZUL)
 
-# ==========================================================
-# 9. CICLO PRINCIPAL
-# ==========================================================
+    # Inicializar el rele apagado
+    rele = OutputDevice(
+        PIN_RELE,
+        active_high=RELE_ACTIVO_EN_ALTO,
+        initial_value=False
+    )
 
-try:
+    apagar_rgb()
+    rele.off()
+
+    # ======================================================
+    # 10. CONEXION CON MONGODB EN WINDOWS
+    # ======================================================
+
+    try:
+        cliente = MongoClient(
+            MONGO_URI,
+            serverSelectionTimeoutMS=5000
+        )
+
+        cliente.admin.command("ping")
+
+        base_datos = cliente[BASE_DATOS]
+        coleccion = base_datos[COLECCION]
+
+        print("Conexion con MongoDB correcta.")
+        print("Servidor:", MONGO_URI)
+        print("Base de datos:", BASE_DATOS)
+        print("Coleccion:", COLECCION)
+
+    except PyMongoError as error:
+        print("No se pudo conectar con MongoDB:", error)
+        print("El monitoreo continuara sin guardar registros.")
+
+        if cliente is not None:
+            cliente.close()
+
+        cliente = None
+        coleccion = None
+
+    # ======================================================
+    # 11. CICLO PRINCIPAL
+    # ======================================================
+
     print("Iniciando monitoreo del invernadero...")
     print("Intervalo:", INTERVALO, "segundos")
 
     while True:
         fecha = datetime.now().astimezone()
 
-        # Lecturas digitales
-        estados = leer_sensores()
+        # Leer entradas digitales
+        estados = leer_sensores_digitales()
 
         suelo_seco = estados["suelo_seco"]
         agua_baja = estados["agua_baja"]
         poca_luz = estados["poca_luz"]
         alarma_temperatura = estados["alarma_temperatura"]
 
-        # Lecturas del DHT22
+        # Leer DHT22
         temperatura_aire, humedad_aire = leer_dht()
 
         estado_temperatura = evaluar_temperatura(
@@ -327,7 +349,7 @@ try:
             humedad_aire
         )
 
-        # Control de bomba y LED
+        # Control de riego
         bomba_activa = controlar_riego(
             suelo_seco,
             agua_baja
@@ -338,6 +360,7 @@ try:
             agua_baja
         )
 
+        # Control del indicador
         estado_rgb = controlar_indicador(
             poca_luz,
             agua_baja,
@@ -349,10 +372,10 @@ try:
         print("\n========== INVERNADERO ==========")
         print("Fecha:", fecha.isoformat())
 
-        print("Temperatura DHT22:", temperatura_aire, "C")
-        print("Humedad del aire:", humedad_aire, "%")
+        print("Temperatura ambiente:", temperatura_aire, "C")
+        print("Humedad ambiente:", humedad_aire, "%")
         print("Estado temperatura:", estado_temperatura)
-        print("Estado humedad aire:", estado_humedad_aire)
+        print("Estado humedad:", estado_humedad_aire)
 
         print("Suelo seco detectado:", suelo_seco)
         print("Nivel de agua bajo:", agua_baja)
@@ -397,24 +420,39 @@ try:
 except KeyboardInterrupt:
     print("\nMonitoreo detenido por el usuario.")
 
+except Exception as error:
+    print("Error inesperado:", error)
+
 finally:
-    # Apagar la bomba y los indicadores al finalizar
-    rele.off()
-    apagar_rgb()
+    # Apagar bomba e indicadores antes de liberar recursos
+    if rele is not None:
+        rele.off()
+
+    if led_rojo is not None:
+        led_rojo.off()
+
+    if led_verde is not None:
+        led_verde.off()
+
+    if led_azul is not None:
+        led_azul.off()
 
     # Liberar recursos
-    dht.exit()
+    for dispositivo in (
+        suelo_sensor,
+        agua_sensor,
+        luz_sensor,
+        temperatura_sensor,
+        led_rojo,
+        led_verde,
+        led_azul,
+        rele
+    ):
+        if dispositivo is not None:
+            dispositivo.close()
 
-    suelo_sensor.close()
-    agua_sensor.close()
-    luz_sensor.close()
-    temperatura_sensor.close()
-
-    led_rojo.close()
-    led_verde.close()
-    led_azul.close()
-
-    rele.close()
+    if dht is not None:
+        dht.exit()
 
     if cliente is not None:
         cliente.close()
